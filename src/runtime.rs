@@ -91,6 +91,7 @@ impl Runtime {
     where
         F: Future<Output = ()> + 'static,
     {
+        let main_fut_id = self.next_future_id;
         self.spawn(fut);
 
         let mut events_buf = vec![EpollEvent::empty(); 128];
@@ -148,6 +149,9 @@ impl Runtime {
                             match fut.poll(&mut cx) {
                                 Poll::Ready(()) => {
                                     self.futures.remove(&future_id);
+                                    if future_id == main_fut_id {
+                                        return;
+                                    }
                                 }
                                 Poll::Pending => {}
                             }
