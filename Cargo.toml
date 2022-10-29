@@ -1,0 +1,16 @@
+[package]
+name = "learning-async"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4.17"
+nix = { version = "0.25.0", features = ["event"] }
+color-eyre = { version = "0.6.2", default-features = false }
+thiserror = "1.0.37"
+
+[dependencies.aqa_logger]
+git = "https://github.com/aQaTL/aqa_logger"
+rev = "8abb7c05ffbef3fd74d5bb06d5d5b905f743946e"
