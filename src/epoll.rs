@@ -24,6 +24,7 @@ pub enum FdType {
     Socket,
     Terminal,
     EventFd,
+    Timer,
 }
 
 impl Epoll {
@@ -37,7 +38,7 @@ impl Epoll {
     }
 
     pub fn add_fd(&mut self, fd: RawFd, flags: EpollFlags, kind: FdType) -> Result<(), Errno> {
-        debug!("Registering fd {fd}");
+        debug!("Registering fd {fd} (epoll {})", self.fd);
         let event_data = EventData { fd };
         let mut event = EpollEvent::new(flags, unsafe { event_data.u64 });
 
@@ -49,7 +50,7 @@ impl Epoll {
     }
 
     pub fn remove_fd(&self, fd: RawFd) -> Result<(), Errno> {
-        info!("Removing fd {fd}");
+        debug!("Removing fd {fd}");
         let event_data = EventData { fd };
         let mut event = EpollEvent::new(EpollFlags::empty(), unsafe { event_data.u64 });
         epoll_ctl(self.fd, EpollOp::EpollCtlDel, fd, &mut event)
@@ -111,6 +112,9 @@ impl Epoll {
                         if fd == 0 && msg.trim() == "stop" {
                             return;
                         }
+                    }
+                    FdType::Timer => {
+                        info!("Timer {fd} fired!");
                     }
                 }
             }

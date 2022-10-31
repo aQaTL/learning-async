@@ -13,29 +13,33 @@ fn main() -> color_eyre::Result<()> {
 
     runtime.spawn(async move {
         info!("Hello world form spawned async function 1");
-        Sleep::new(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(1)).await;
         info!("Slept for 1 second");
     });
 
     runtime.spawn(async move {
         info!("Hello world form spawned async function 2");
-        Sleep::new(Duration::from_secs(3)).await;
+        sleep(Duration::from_secs(3)).await;
         info!("Slept for 3 seconds");
     });
 
     runtime.spawn(async move {
         info!("Hello world form spawned async function 3");
-        Sleep::new(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
         info!("Slept for 300 milliseconds");
     });
 
     runtime.block_on(async move {
         info!("Hello world form main async function");
-        Sleep::new(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(5)).await;
         info!("Slept for 5 seconds");
     });
 
     Ok(())
+}
+
+fn sleep(duration: Duration) -> Sleep {
+    Sleep::new(duration)
 }
 
 struct Sleep {

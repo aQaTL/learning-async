@@ -10,6 +10,7 @@ log = "0.4.17"
 nix = { version = "0.25.0", features = ["event"] }
 color-eyre = { version = "0.6.2", default-features = false }
 thiserror = "1.0.37"
+humantime = "2.1.0"
 
 [dependencies.aqa_logger]
 git = "https://github.com/aQaTL/aqa_logger"

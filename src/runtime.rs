@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::ops::DerefMut;
-use std::os::unix::io::AsRawFd;
+use std::ops::{ControlFlow, DerefMut};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, Weak};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use log::{debug, error, info};
-use nix::sys::epoll::EpollEvent;
+use nix::sys::epoll::{EpollEvent, EpollFlags};
 use nix::unistd::read;
 use thiserror::Error;
 
@@ -17,13 +17,20 @@ use crate::signal::Signal;
 static WAKER_VTABLE: RawWakerVTable =
     RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
 
+static mut RUNTIME_MSG_QUEUE: Option<Arc<RuntimeMsgQueue>> = None;
+
 pub struct Runtime {
     waker_signal_fd: Arc<Signal>,
 
     epoll: Epoll,
 
+    msg_queue: Arc<RuntimeMsgQueue>,
+
     next_future_id: u64,
+    main_future_id: u64,
+
     futures: HashMap<u64, (Box<dyn Future<Output = ()>>, Waker)>,
+    timers: HashMap<RawFd, Waker>,
 }
 
 struct WakerContext {
@@ -46,9 +53,16 @@ impl Runtime {
         let rt = Runtime {
             waker_signal_fd,
             epoll,
+            msg_queue: Default::default(),
             next_future_id: 143,
+            main_future_id: 142,
             futures: HashMap::default(),
+            timers: HashMap::default(),
         };
+
+        unsafe {
+            RUNTIME_MSG_QUEUE = Some(Arc::clone(&rt.msg_queue));
+        }
 
         Ok(rt)
     }
@@ -77,13 +91,8 @@ impl Runtime {
         let fut: Pin<&mut (dyn Future<Output = ()> + 'static)> =
             unsafe { Pin::new_unchecked(fut.deref_mut()) };
 
-        match fut.poll(&mut cx) {
-            Poll::Ready(()) => {
-                self.futures.remove(&future_id);
-            }
-            Poll::Pending => {
-                // self.epoll.add_signal(future_id).unwrap();
-            }
+        if let Poll::Ready(()) = fut.poll(&mut cx) {
+            self.futures.remove(&future_id);
         }
     }
 
@@ -91,19 +100,27 @@ impl Runtime {
     where
         F: Future<Output = ()> + 'static,
     {
-        let main_fut_id = self.next_future_id;
+        self.main_future_id = self.next_future_id;
         self.spawn(fut);
 
         let mut events_buf = vec![EpollEvent::empty(); 128];
         let mut buf = [0_u8; 1024];
 
         loop {
-            // for mut fut in &mut self.futures {
-            //     let fut = unsafe { Pin::new_unchecked(&mut fut) };
-            //     if let Poll::Ready(v) = fut.poll(&mut cx) {
-            //         return v;
-            //     }
-            // }
+            for msg in self.msg_queue.queue.write().unwrap().drain(..) {
+                match msg {
+                    RuntimeMsg::RegisterTimer { waker, timer_fd } => {
+                        if let Err(err) =
+                            self.epoll
+                                .add_fd(timer_fd, EpollFlags::EPOLLIN, FdType::Timer)
+                        {
+                            error!("Failed to register timer: {err:} ({})", err.desc());
+                        }
+                        self.timers.insert(timer_fd, waker);
+                        debug!("Timer {timer_fd} registered");
+                    }
+                }
+            }
 
             for event in self.epoll.poll(&mut events_buf).unwrap() {
                 let event_data = EventData { u64: event.data() };
@@ -131,29 +148,9 @@ impl Runtime {
                         if fd != self.waker_signal_fd.as_raw_fd() {
                             info!("Received signal({val}) from eventfd {fd}");
                         } else {
-                            let future_id = val;
-                            let (fut, waker) = match self.futures.get_mut(&future_id) {
-                                Some(v) => v,
-                                None => {
-                                    error!("Recieved signal for unknown future (ID {val})");
-                                    continue;
-                                }
-                            };
-
-                            let mut cx = Context::from_waker(waker);
-
-                            // let fut: Pin<&mut Box<dyn Future<Output = () >>> = fut.as_mut();
-                            let fut: Pin<&mut (dyn Future<Output = ()> + 'static)> =
-                                unsafe { Pin::new_unchecked(fut.deref_mut()) };
-
-                            match fut.poll(&mut cx) {
-                                Poll::Ready(()) => {
-                                    self.futures.remove(&future_id);
-                                    if future_id == main_fut_id {
-                                        return;
-                                    }
-                                }
-                                Poll::Pending => {}
+                            match self.poll_fut(val) {
+                                ControlFlow::Break(()) => return,
+                                ControlFlow::Continue(()) => continue,
                             }
                         }
                     }
@@ -165,9 +162,53 @@ impl Runtime {
                             return;
                         }
                     }
+                    FdType::Timer => {
+                        debug!("Timer {fd} fired!");
+                        let waker = match self.timers.remove(&fd) {
+                            Some(v) => v,
+                            None => {
+                                error!("No future for timer {fd}");
+                                continue;
+                            }
+                        };
+
+                        if let Err(err) = self.epoll.remove_fd(fd) {
+                            error!("Failed to remove timerfd fd from epoll. {err:?}");
+                        }
+
+                        waker.wake();
+                    }
                 }
             }
         }
+    }
+
+    fn poll_fut(&mut self, future_id: u64) -> ControlFlow<()> {
+        let (fut, waker) = match self.futures.get_mut(&future_id) {
+            Some(v) => v,
+            None => {
+                error!("Recieved signal for unknown future (ID {future_id})");
+                return ControlFlow::Continue(());
+            }
+        };
+
+        let mut cx = Context::from_waker(waker);
+
+        // let fut: Pin<&mut Box<dyn Future<Output = () >>> = fut.as_mut();
+        let fut: Pin<&mut (dyn Future<Output = ()> + 'static)> =
+            unsafe { Pin::new_unchecked(fut.deref_mut()) };
+
+        match fut.poll(&mut cx) {
+            Poll::Ready(()) => {
+                self.futures.remove(&future_id);
+                if future_id == self.main_future_id {
+                    return ControlFlow::Break(());
+                }
+            }
+            Poll::Pending => (),
+        }
+
+        ControlFlow::Continue(())
     }
 }
 
@@ -207,4 +248,24 @@ unsafe fn drop_fn(waker_ctx: *const ()) {
     drop(Arc::from_raw((waker_ctx as *mut ()).cast::<WakerContext>()))
 }
 
-pub struct TcpConnection {}
+#[derive(Default)]
+pub(crate) struct RuntimeMsgQueue {
+    queue: RwLock<Vec<RuntimeMsg>>,
+}
+
+impl RuntimeMsgQueue {
+    pub(crate) fn try_current() -> Option<&'static RuntimeMsgQueue> {
+        unsafe { RUNTIME_MSG_QUEUE.as_deref() }
+    }
+
+    pub fn send(&self, msg: RuntimeMsg) {
+        self.queue
+            .write()
+            .expect("Failed to acquire RuntimeMessageQueue lock")
+            .push(msg)
+    }
+}
+
+pub(crate) enum RuntimeMsg {
+    RegisterTimer { waker: Waker, timer_fd: RawFd },
+}
