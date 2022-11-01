@@ -138,6 +138,7 @@ impl Runtime {
                 }
             }
 
+            debug!("Polling {} futures", futures_to_poll.len());
             for future_id in futures_to_poll.drain(..) {
                 match rt.poll_fut(future_id) {
                     ControlFlow::Break(()) => return,

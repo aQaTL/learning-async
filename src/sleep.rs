@@ -34,6 +34,12 @@ impl Sleep {
             started: None,
         })
     }
+
+    fn expired(&self) -> bool {
+        self.started
+            .map(|started| started + self.duration <= Instant::now())
+            .unwrap_or_default()
+    }
 }
 
 impl Future for Sleep {
@@ -57,8 +63,10 @@ impl Future for Sleep {
                 });
 
             Poll::Pending
-        } else {
+        } else if self.expired() {
             Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 }
