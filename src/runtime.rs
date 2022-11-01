@@ -3,10 +3,11 @@ use std::future::Future;
 use std::ops::{ControlFlow, DerefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
+use nix::errno::Errno;
 use nix::sys::epoll::{EpollEvent, EpollFlags};
 use nix::unistd::read;
 use thiserror::Error;
@@ -20,29 +21,33 @@ static WAKER_VTABLE: RawWakerVTable =
 static mut RUNTIME_MSG_QUEUE: Option<Arc<RuntimeMsgQueue>> = None;
 
 pub struct Runtime {
+    msg_queue: Arc<RuntimeMsgQueue>,
+    // Moved into a separate struct to separate msg_queue borrow from the rest of [Runtime] data
+    event_loop: RuntimeEventLoopData,
+}
+
+struct RuntimeEventLoopData {
     waker_signal_fd: Arc<Signal>,
 
     epoll: Epoll,
-
-    msg_queue: Arc<RuntimeMsgQueue>,
 
     next_future_id: u64,
     main_future_id: u64,
 
     futures: HashMap<u64, (Box<dyn Future<Output = ()>>, Waker)>,
     timers: HashMap<RawFd, Waker>,
+    network_sockets: HashMap<RawFd, Waker>,
 }
 
 struct WakerContext {
-    _runtime_handle: Weak<Runtime>,
     future_id: u64,
-    waker_signal_fd: Arc<Signal>,
+    _waker_signal_fd: Arc<Signal>,
 }
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("epoll error: {0:?}")]
-    Epoll(nix::errno::Errno),
+    Epoll(Errno),
 }
 
 impl Runtime {
@@ -51,13 +56,16 @@ impl Runtime {
         let waker_signal_fd = Arc::new(epoll.add_signal().map_err(RuntimeError::Epoll)?);
 
         let rt = Runtime {
-            waker_signal_fd,
-            epoll,
+            event_loop: RuntimeEventLoopData {
+                waker_signal_fd,
+                epoll,
+                next_future_id: 143,
+                main_future_id: 142,
+                futures: HashMap::default(),
+                timers: HashMap::default(),
+                network_sockets: HashMap::default(),
+            },
             msg_queue: Default::default(),
-            next_future_id: 143,
-            main_future_id: 142,
-            futures: HashMap::default(),
-            timers: HashMap::default(),
         };
 
         unsafe {
@@ -71,13 +79,187 @@ impl Runtime {
     where
         F: Future<Output = ()> + 'static,
     {
+        self.event_loop.spawn(fut)
+    }
+
+    pub fn block_on<F>(&mut self, fut: F) -> <F as Future>::Output
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        self.event_loop.main_future_id = self.event_loop.next_future_id;
+        self.spawn(fut);
+
+        // If the main future completed after the first poll, return
+        if self
+            .event_loop
+            .futures
+            .get(&self.event_loop.main_future_id)
+            .is_none()
+        {
+            return;
+        }
+
+        let mut events_buf = vec![EpollEvent::empty(); 128];
+
+        let mut futures_to_poll = Vec::new();
+
+        loop {
+            let rt = &mut self.event_loop;
+
+            for msg in self.msg_queue.queue.write().unwrap().drain(..) {
+                match msg {
+                    RuntimeMsg::Wake { future_id } => futures_to_poll.push(future_id),
+                    RuntimeMsg::RegisterTimer { waker, timer_fd } => {
+                        if let Err(err) =
+                            rt.epoll
+                                .add_fd(timer_fd, EpollFlags::EPOLLIN, FdType::Timer)
+                        {
+                            error!("Failed to register timer: {err:?} ({})", err.desc());
+                        }
+                        rt.timers.insert(timer_fd, waker);
+                        debug!("Timer {timer_fd} registered");
+                    }
+                    RuntimeMsg::RegisterTcpStream { waker, socket } => {
+                        match rt.epoll.add_fd(
+                            socket,
+                            // EpollFlags::EPOLLIN | EpollFlags::EPOLLOUT,
+                            //TODO use edge-triggered mode
+                            EpollFlags::EPOLLIN,
+                            FdType::Socket,
+                        ) {
+                            Err(Errno::EEXIST) | Ok(()) => (),
+                            Err(err) => {
+                                error!("Failed to register tcp stream: {err:?} ({})", err.desc());
+                            }
+                        }
+                        rt.network_sockets.insert(socket, waker);
+                        debug!("TcpStream {socket} registered");
+                    }
+                }
+            }
+
+            for future_id in futures_to_poll.drain(..) {
+                match rt.poll_fut(future_id) {
+                    ControlFlow::Break(()) => return,
+                    ControlFlow::Continue(()) => continue,
+                }
+            }
+
+            for event in rt.epoll.poll(&mut events_buf).unwrap() {
+                let event_data = EventData { u64: event.data() };
+                let fd = unsafe { event_data.fd };
+                let kind = rt.epoll.registered.get(&fd).unwrap();
+                debug!("Received event on fd {fd} with registered type {kind:?}");
+
+                let result: LoopFlow = match kind {
+                    FdType::EventFd => rt.handle_event_on_eventfd(fd),
+                    FdType::Socket => rt.handle_event_on_socket(fd),
+                    FdType::Terminal => rt.handle_event_on_terminal(fd),
+                    FdType::Timer => rt.handle_event_on_timer(fd),
+                };
+                match result {
+                    ControlFlow::Continue(()) => continue,
+                    ControlFlow::Break(()) => return,
+                }
+            }
+            events_buf
+                .iter_mut()
+                .for_each(|event| *event = EpollEvent::empty());
+        }
+    }
+}
+
+type LoopFlow = ControlFlow<()>;
+
+impl RuntimeEventLoopData {
+    pub fn handle_event_on_eventfd(&mut self, fd: i32) -> LoopFlow {
+        let mut buf = [0_u8; 8];
+        let bytes = match read(fd, &mut buf) {
+            Ok(bytes_read) if bytes_read == 0 => {
+                self.epoll.remove_fd(fd).unwrap();
+                self.epoll.registered.remove(&fd);
+                return LoopFlow::Continue(());
+            }
+            Ok(bytes_read) => &buf[0..bytes_read],
+            Err(err) => {
+                error!("Read failed. {err:?}");
+                return LoopFlow::Continue(());
+            }
+        };
+        debug!("Bytes read: {}", bytes.len());
+        debug_assert!(bytes.len() >= 8, "expected to read 8 bytes");
+        let val = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+
+        if fd != self.waker_signal_fd.as_raw_fd() {
+            warn!("Received signal({val}) from eventfd {fd}");
+            ControlFlow::Continue(())
+        } else {
+            self.poll_fut(val)
+        }
+    }
+
+    pub fn handle_event_on_socket(&mut self, fd: i32) -> LoopFlow {
+        match self.network_sockets.get(&fd) {
+            Some(waker) => waker.wake_by_ref(),
+            None => panic!("No future for TcpStream {fd}"),
+        }
+        LoopFlow::Continue(())
+    }
+
+    pub fn handle_event_on_terminal(&mut self, fd: i32) -> LoopFlow {
+        let mut buf = [0_u8; 1024];
+        let bytes = match read(fd, &mut buf) {
+            Ok(bytes_read) if bytes_read == 0 => {
+                self.epoll.remove_fd(fd).unwrap();
+                self.epoll.registered.remove(&fd);
+                return LoopFlow::Continue(());
+            }
+            Ok(bytes_read) => &buf[0..bytes_read],
+            Err(err) => {
+                error!("Read failed. {err:?}");
+                return LoopFlow::Continue(());
+            }
+        };
+        debug!("Bytes read: {}", bytes.len());
+
+        let msg = String::from_utf8_lossy(bytes);
+
+        info!("Received message: \"{msg}\"");
+        if fd == 0 && msg.trim() == "stop" {
+            return LoopFlow::Break(());
+        }
+        LoopFlow::Continue(())
+    }
+
+    pub fn handle_event_on_timer(&mut self, fd: i32) -> LoopFlow {
+        debug!("Timer {fd} fired!");
+        let waker = match self.timers.remove(&fd) {
+            Some(v) => v,
+            None => {
+                error!("No future for timer {fd}");
+                return LoopFlow::Continue(());
+            }
+        };
+
+        if let Err(err) = self.epoll.remove_fd(fd) {
+            error!("Failed to remove timerfd fd from epoll. {err:?}");
+        }
+
+        waker.wake();
+
+        LoopFlow::Continue(())
+    }
+
+    pub fn spawn<F>(&mut self, fut: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
         let future_id = self.next_future_id;
         self.next_future_id += 1;
 
         let waker_ctx_ptr = Arc::into_raw(Arc::new(WakerContext {
-            _runtime_handle: Default::default(),
             future_id,
-            waker_signal_fd: Arc::clone(&self.waker_signal_fd),
+            _waker_signal_fd: Arc::clone(&self.waker_signal_fd),
         }));
         let waker =
             unsafe { Waker::from_raw(RawWaker::new(waker_ctx_ptr.cast::<()>(), &WAKER_VTABLE)) };
@@ -93,93 +275,6 @@ impl Runtime {
 
         if let Poll::Ready(()) = fut.poll(&mut cx) {
             self.futures.remove(&future_id);
-        }
-    }
-
-    pub fn block_on<F>(&mut self, fut: F) -> <F as Future>::Output
-    where
-        F: Future<Output = ()> + 'static,
-    {
-        self.main_future_id = self.next_future_id;
-        self.spawn(fut);
-
-        let mut events_buf = vec![EpollEvent::empty(); 128];
-        let mut buf = [0_u8; 1024];
-
-        loop {
-            for msg in self.msg_queue.queue.write().unwrap().drain(..) {
-                match msg {
-                    RuntimeMsg::RegisterTimer { waker, timer_fd } => {
-                        if let Err(err) =
-                            self.epoll
-                                .add_fd(timer_fd, EpollFlags::EPOLLIN, FdType::Timer)
-                        {
-                            error!("Failed to register timer: {err:} ({})", err.desc());
-                        }
-                        self.timers.insert(timer_fd, waker);
-                        debug!("Timer {timer_fd} registered");
-                    }
-                }
-            }
-
-            for event in self.epoll.poll(&mut events_buf).unwrap() {
-                let event_data = EventData { u64: event.data() };
-                let fd = unsafe { event_data.fd };
-                let kind = self.epoll.registered.get(&fd).unwrap();
-                debug!("Received event on fd {fd}");
-
-                let bytes = match read(fd, &mut buf) {
-                    Ok(bytes_read) if bytes_read == 0 => {
-                        self.epoll.remove_fd(fd).unwrap();
-                        self.epoll.registered.remove(&fd);
-                        continue;
-                    }
-                    Ok(bytes_read) => &buf[0..bytes_read],
-                    Err(err) => {
-                        error!("Read failed. {err:?}");
-                        continue;
-                    }
-                };
-                debug!("Bytes read: {}", bytes.len());
-
-                match kind {
-                    FdType::EventFd => {
-                        let val = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
-                        if fd != self.waker_signal_fd.as_raw_fd() {
-                            info!("Received signal({val}) from eventfd {fd}");
-                        } else {
-                            match self.poll_fut(val) {
-                                ControlFlow::Break(()) => return,
-                                ControlFlow::Continue(()) => continue,
-                            }
-                        }
-                    }
-                    FdType::Terminal | FdType::Socket => {
-                        let msg = String::from_utf8_lossy(bytes);
-
-                        info!("Received message: \"{msg}\"");
-                        if fd == 0 && msg.trim() == "stop" {
-                            return;
-                        }
-                    }
-                    FdType::Timer => {
-                        debug!("Timer {fd} fired!");
-                        let waker = match self.timers.remove(&fd) {
-                            Some(v) => v,
-                            None => {
-                                error!("No future for timer {fd}");
-                                continue;
-                            }
-                        };
-
-                        if let Err(err) = self.epoll.remove_fd(fd) {
-                            error!("Failed to remove timerfd fd from epoll. {err:?}");
-                        }
-
-                        waker.wake();
-                    }
-                }
-            }
         }
     }
 
@@ -220,7 +315,8 @@ unsafe fn clone_fn(waker_ctx: *const ()) -> RawWaker {
 
     //Prevent deallocating pointer passed into this fn
     let _ = Arc::into_raw(waker_ctx);
-    RawWaker::new(Arc::into_raw(new_waker_ctx).cast::<()>(), &WAKER_VTABLE)
+    let data = Arc::into_raw(new_waker_ctx).cast::<()>();
+    RawWaker::new(data, &WAKER_VTABLE)
 }
 
 unsafe fn wake_fn(waker_ctx: *const ()) {
@@ -235,9 +331,14 @@ unsafe fn wake_by_ref_fn(waker_ctx: *const ()) {
     debug!("wake_by_ref_fn");
 
     let waker_ctx: Arc<WakerContext> = Arc::from_raw(waker_ctx.cast::<WakerContext>());
-    if let Err(err) = waker_ctx.waker_signal_fd.signal(waker_ctx.future_id) {
-        error!("Failed to signal wake. {err:?}");
-    }
+    RuntimeMsgQueue::try_current()
+        .unwrap()
+        .send(RuntimeMsg::Wake {
+            future_id: waker_ctx.future_id,
+        });
+    // if let Err(err) = waker_ctx.waker_signal_fd.signal(waker_ctx.future_id) {
+    //     error!("Failed to signal wake. {err:?}");
+    // }
 
     //Prevent deallocating pointer passed into this fn
     let _ = Arc::into_raw(waker_ctx);
@@ -258,6 +359,10 @@ impl RuntimeMsgQueue {
         unsafe { RUNTIME_MSG_QUEUE.as_deref() }
     }
 
+    pub(crate) fn current() -> &'static RuntimeMsgQueue {
+        RuntimeMsgQueue::try_current().expect("no runtime")
+    }
+
     pub fn send(&self, msg: RuntimeMsg) {
         self.queue
             .write()
@@ -268,4 +373,6 @@ impl RuntimeMsgQueue {
 
 pub(crate) enum RuntimeMsg {
     RegisterTimer { waker: Waker, timer_fd: RawFd },
+    RegisterTcpStream { waker: Waker, socket: RawFd },
+    Wake { future_id: u64 },
 }

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use log::info;
 
-use learning_async::epoll::Epoll;
+use learning_async::epoll::{example_epoll_event_loop, Epoll};
 
 fn main() -> color_eyre::Result<()> {
     aqa_logger::init();
@@ -21,7 +21,7 @@ fn main() -> color_eyre::Result<()> {
         std::thread::sleep(Duration::from_secs(1));
     });
 
-    epoll.start();
+    example_epoll_event_loop(epoll);
 
     Ok(())
 }

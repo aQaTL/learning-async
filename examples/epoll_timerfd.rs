@@ -8,7 +8,7 @@ use nix::sys::time::TimeSpec;
 use nix::sys::timer::TimerSetTimeFlags;
 use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags};
 
-use learning_async::epoll::{Epoll, FdType};
+use learning_async::epoll::{example_epoll_event_loop, Epoll, FdType};
 
 fn main() -> color_eyre::Result<()> {
     aqa_logger::init();
@@ -59,7 +59,7 @@ fn main() -> color_eyre::Result<()> {
         Result::<_, Errno>::Ok(())
     })?;
 
-    epoll.start();
+    example_epoll_event_loop(epoll);
 
     Ok(())
 }

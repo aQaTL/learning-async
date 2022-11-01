@@ -3,7 +3,7 @@ use nix::sys::epoll::EpollFlags;
 use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
 
-use learning_async::epoll::{Epoll, FdType};
+use learning_async::epoll::{example_epoll_event_loop, Epoll, FdType};
 
 fn main() -> color_eyre::Result<()> {
     aqa_logger::init();
@@ -25,7 +25,7 @@ fn main() -> color_eyre::Result<()> {
     );
     epoll.add_fd(tcp_stream.as_raw_fd(), EpollFlags::EPOLLIN, FdType::Socket)?;
 
-    epoll.start();
+    example_epoll_event_loop(epoll);
 
     Ok(())
 }

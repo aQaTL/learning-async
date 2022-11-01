@@ -19,7 +19,7 @@ pub struct Epoll {
     pub(crate) registered: HashMap<RawFd, FdType>,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum FdType {
     Socket,
     Terminal,
@@ -64,63 +64,6 @@ impl Epoll {
         Ok(unsafe { Signal::from_raw_fd(fd) })
     }
 
-    pub fn start(mut self) {
-        let mut events_buf = vec![EpollEvent::empty(); 128];
-        let mut buf = [0_u8; 1024];
-
-        loop {
-            debug!("Polling for input...");
-
-            let event_count = epoll_wait(
-                self.fd,
-                &mut events_buf,
-                self.timeout.as_millis().try_into().unwrap(),
-            )
-            .unwrap();
-            debug!("Polled {event_count} events");
-
-            for event in &events_buf[0..event_count] {
-                let data = EventData { u64: event.data() };
-                let fd = unsafe { data.fd };
-                let kind = self.registered.get(&fd).unwrap();
-
-                debug!("Reading file descriptor {fd}");
-
-                let bytes = match read(fd, &mut buf) {
-                    Ok(bytes_read) if bytes_read == 0 => {
-                        self.remove_fd(fd).unwrap();
-                        self.registered.remove(&fd);
-                        continue;
-                    }
-                    Ok(bytes_read) => &buf[0..bytes_read],
-                    Err(err) => {
-                        error!("Read failed. {err:?}");
-                        continue;
-                    }
-                };
-                debug!("Bytes read: {}", bytes.len());
-
-                match kind {
-                    FdType::EventFd => {
-                        let val = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
-                        info!("Received signal({val}) from eventfd {fd}");
-                    }
-                    FdType::Terminal | FdType::Socket => {
-                        let msg = String::from_utf8_lossy(bytes);
-
-                        info!("Received message: \"{msg}\"");
-                        if fd == 0 && msg.trim() == "stop" {
-                            return;
-                        }
-                    }
-                    FdType::Timer => {
-                        info!("Timer {fd} fired!");
-                    }
-                }
-            }
-        }
-    }
-
     pub fn poll<'a, 'b>(
         &'a mut self,
         events: &'b mut [EpollEvent],
@@ -151,4 +94,52 @@ pub(crate) union EventData {
     pub fd: i32,
     pub u32: u32,
     pub u64: u64,
+}
+
+// Example poll loop. Used in examples in $CARGO_MANIFEST_DIR/examples
+pub fn example_epoll_event_loop(mut epoll: Epoll) {
+    let mut events_buf = vec![EpollEvent::empty(); 128];
+    let mut buf = [0_u8; 1024];
+
+    loop {
+        for event in epoll.poll(&mut events_buf).unwrap() {
+            let data = EventData { u64: event.data() };
+            let fd = unsafe { data.fd };
+            let kind = epoll.registered.get(&fd).unwrap();
+
+            debug!("Reading file descriptor {fd}");
+
+            let bytes = match read(fd, &mut buf) {
+                Ok(bytes_read) if bytes_read == 0 => {
+                    epoll.remove_fd(fd).unwrap();
+                    epoll.registered.remove(&fd);
+                    continue;
+                }
+                Ok(bytes_read) => &buf[0..bytes_read],
+                Err(err) => {
+                    error!("Read failed. {err:?}");
+                    continue;
+                }
+            };
+            debug!("Bytes read: {}", bytes.len());
+
+            match kind {
+                FdType::EventFd => {
+                    let val = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+                    info!("Received signal({val}) from eventfd {fd}");
+                }
+                FdType::Terminal | FdType::Socket => {
+                    let msg = String::from_utf8_lossy(bytes);
+
+                    info!("Received message: \"{msg}\"");
+                    if fd == 0 && msg.trim() == "stop" {
+                        return;
+                    }
+                }
+                FdType::Timer => {
+                    info!("Timer {fd} fired!");
+                }
+            }
+        }
+    }
 }
