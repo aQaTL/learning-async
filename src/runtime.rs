@@ -41,7 +41,7 @@ struct RuntimeEventLoopData {
 
 struct WakerContext {
     future_id: u64,
-    _waker_signal_fd: Arc<Signal>,
+    waker_signal_fd: Arc<Signal>,
 }
 
 #[derive(Debug, Error)]
@@ -264,7 +264,7 @@ impl RuntimeEventLoopData {
 
         let waker_ctx_ptr = Arc::into_raw(Arc::new(WakerContext {
             future_id,
-            _waker_signal_fd: Arc::clone(&self.waker_signal_fd),
+            waker_signal_fd: Arc::clone(&self.waker_signal_fd),
         }));
         let waker =
             unsafe { Waker::from_raw(RawWaker::new(waker_ctx_ptr.cast::<()>(), &WAKER_VTABLE)) };
@@ -294,7 +294,6 @@ impl RuntimeEventLoopData {
 
         let mut cx = Context::from_waker(waker);
 
-        // let fut: Pin<&mut Box<dyn Future<Output = () >>> = fut.as_mut();
         let fut: Pin<&mut (dyn Future<Output = ()> + 'static)> =
             unsafe { Pin::new_unchecked(fut.deref_mut()) };
 
@@ -337,14 +336,18 @@ unsafe fn wake_by_ref_fn(waker_ctx: *const ()) {
     debug!("wake_by_ref_fn");
 
     let waker_ctx: Arc<WakerContext> = Arc::from_raw(waker_ctx.cast::<WakerContext>());
-    RuntimeMsgQueue::try_current()
-        .unwrap()
-        .send(RuntimeMsg::Wake {
-            future_id: waker_ctx.future_id,
-        });
-    // if let Err(err) = waker_ctx.waker_signal_fd.signal(waker_ctx.future_id) {
-    //     error!("Failed to signal wake. {err:?}");
-    // }
+
+    // Using msg queue here doesn't work, because when all no future uses epoll (but for example
+    // self spawned threads), epoll will block until timeout before we can process this message.
+    // RuntimeMsgQueue::try_current()
+    //     .unwrap()
+    //     .send(RuntimeMsg::Wake {
+    //         future_id: waker_ctx.future_id,
+    //     });
+
+    if let Err(err) = waker_ctx.waker_signal_fd.signal(waker_ctx.future_id) {
+        error!("Failed to signal wake. {err:?}");
+    }
 
     //Prevent deallocating pointer passed into this fn
     let _ = Arc::into_raw(waker_ctx);
@@ -378,7 +381,16 @@ impl RuntimeMsgQueue {
 }
 
 pub(crate) enum RuntimeMsg {
-    RegisterTimer { waker: Waker, timer_fd: RawFd },
-    RegisterTcpStream { waker: Waker, socket: RawFd },
-    Wake { future_id: u64 },
+    RegisterTimer {
+        waker: Waker,
+        timer_fd: RawFd,
+    },
+    RegisterTcpStream {
+        waker: Waker,
+        socket: RawFd,
+    },
+    #[allow(dead_code)]
+    Wake {
+        future_id: u64,
+    },
 }
