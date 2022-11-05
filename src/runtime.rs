@@ -12,7 +12,7 @@ use nix::sys::epoll::{EpollEvent, EpollFlags};
 use nix::unistd::read;
 use thiserror::Error;
 
-use crate::epoll::{Epoll, EventData, FdType};
+use crate::epoll::{Epoll, EventData, FdType, MyEventData};
 use crate::signal::Signal;
 
 static WAKER_VTABLE: RawWakerVTable =
@@ -106,51 +106,57 @@ impl Runtime {
         loop {
             let rt = &mut self.event_loop;
 
-            for msg in self.msg_queue.queue.write().unwrap().drain(..) {
-                match msg {
-                    RuntimeMsg::Wake { future_id } => futures_to_poll.push(future_id),
-                    RuntimeMsg::RegisterTimer { waker, timer_fd } => {
-                        if let Err(err) =
-                            rt.epoll
-                                .add_fd(timer_fd, EpollFlags::EPOLLIN, FdType::Timer)
-                        {
-                            error!("Failed to register timer: {err:?} ({})", err.desc());
-                        }
-                        rt.timers.insert(timer_fd, waker);
-                        debug!("Timer {timer_fd} registered");
-                    }
-                    RuntimeMsg::RegisterTcpStream { waker, socket } => {
-                        match rt.epoll.add_fd(
-                            socket,
-                            // EpollFlags::EPOLLIN | EpollFlags::EPOLLOUT,
-                            //TODO use edge-triggered mode
-                            EpollFlags::EPOLLIN,
-                            FdType::Socket,
-                        ) {
-                            Err(Errno::EEXIST) | Ok(()) => (),
-                            Err(err) => {
-                                error!("Failed to register tcp stream: {err:?} ({})", err.desc());
+            while !self.msg_queue.queue.read().unwrap().is_empty() {
+                debug!("Looping over msg_queue");
+                for msg in self.msg_queue.queue.write().unwrap().drain(..) {
+                    match msg {
+                        RuntimeMsg::Wake { future_id } => futures_to_poll.push(future_id),
+                        RuntimeMsg::RegisterTimer { waker, timer_fd } => {
+                            if let Err(err) =
+                                rt.epoll
+                                    .add_fd(timer_fd, EpollFlags::EPOLLIN, FdType::Timer)
+                            {
+                                error!("Failed to register timer: {err:?} ({})", err.desc());
                             }
+                            rt.timers.insert(timer_fd, waker);
+                            debug!("Timer {timer_fd} registered");
                         }
-                        rt.network_sockets.insert(socket, waker);
-                        debug!("TcpStream {socket} registered");
+                        RuntimeMsg::RegisterTcpStream { waker, socket } => {
+                            match rt.epoll.add_fd(
+                                socket,
+                                // EpollFlags::EPOLLIN | EpollFlags::EPOLLOUT,
+                                EpollFlags::EPOLLIN,
+                                FdType::Socket,
+                            ) {
+                                Err(Errno::EEXIST) | Ok(()) => (),
+                                Err(err) => {
+                                    error!(
+                                        "Failed to register tcp stream: {err:?} ({})",
+                                        err.desc()
+                                    );
+                                }
+                            }
+                            rt.network_sockets.insert(socket, waker);
+                            debug!("TcpStream {socket} registered");
+                        }
                     }
                 }
-            }
 
-            debug!("Polling {} futures", futures_to_poll.len());
-            for future_id in futures_to_poll.drain(..) {
-                match rt.poll_fut(future_id) {
-                    ControlFlow::Break(()) => return,
-                    ControlFlow::Continue(()) => continue,
+                debug!("Polling {} futures", futures_to_poll.len());
+                for future_id in futures_to_poll.drain(..) {
+                    match rt.poll_fut(future_id) {
+                        ControlFlow::Break(()) => return,
+                        ControlFlow::Continue(()) => continue,
+                    }
                 }
             }
 
             for event in rt.epoll.poll(&mut events_buf).unwrap() {
-                let event_data = EventData { u64: event.data() };
-                let fd = unsafe { event_data.fd };
-                let kind = rt.epoll.registered.get(&fd).unwrap();
-                debug!("Received event on fd {fd} with registered type {kind:?}");
+                let MyEventData { fd, kind } = unsafe { EventData { u64: event.data() }.data };
+                debug!(
+                    "Received events ({events:?}) on fd {fd} with registered type {kind:?}",
+                    events = event.events()
+                );
 
                 let result: LoopFlow = match kind {
                     FdType::EventFd => rt.handle_event_on_eventfd(fd),
@@ -178,7 +184,6 @@ impl RuntimeEventLoopData {
         let bytes = match read(fd, &mut buf) {
             Ok(bytes_read) if bytes_read == 0 => {
                 self.epoll.remove_fd(fd).unwrap();
-                self.epoll.registered.remove(&fd);
                 return LoopFlow::Continue(());
             }
             Ok(bytes_read) => &buf[0..bytes_read],
@@ -212,7 +217,6 @@ impl RuntimeEventLoopData {
         let bytes = match read(fd, &mut buf) {
             Ok(bytes_read) if bytes_read == 0 => {
                 self.epoll.remove_fd(fd).unwrap();
-                self.epoll.registered.remove(&fd);
                 return LoopFlow::Continue(());
             }
             Ok(bytes_read) => &buf[0..bytes_read],
@@ -283,7 +287,7 @@ impl RuntimeEventLoopData {
         let (fut, waker) = match self.futures.get_mut(&future_id) {
             Some(v) => v,
             None => {
-                error!("Recieved signal for unknown future (ID {future_id})");
+                error!("Received signal for unknown future (ID {future_id})");
                 return ControlFlow::Continue(());
             }
         };
@@ -296,6 +300,7 @@ impl RuntimeEventLoopData {
 
         match fut.poll(&mut cx) {
             Poll::Ready(()) => {
+                debug!("Removing future {future_id}");
                 self.futures.remove(&future_id);
                 if future_id == self.main_future_id {
                     return ControlFlow::Break(());

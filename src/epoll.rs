@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::time::Duration;
 
@@ -15,16 +14,15 @@ use crate::signal::Signal;
 pub struct Epoll {
     fd: RawFd,
     timeout: Duration,
-
-    pub(crate) registered: HashMap<RawFd, FdType>,
 }
 
 #[derive(Copy, Clone, Debug)]
+#[repr(u32)]
 pub enum FdType {
-    Socket,
     Terminal,
     EventFd,
     Timer,
+    Socket,
 }
 
 impl Epoll {
@@ -33,18 +31,18 @@ impl Epoll {
         Ok(Epoll {
             fd,
             timeout: Duration::from_secs(30),
-            registered: HashMap::default(),
         })
     }
 
-    pub fn add_fd(&mut self, fd: RawFd, flags: EpollFlags, kind: FdType) -> Result<(), Errno> {
+    pub fn add_fd(&mut self, fd: RawFd, mut flags: EpollFlags, kind: FdType) -> Result<(), Errno> {
         debug!("Registering fd {fd} (epoll {})", self.fd);
-        let event_data = EventData { fd };
+        let event_data = EventData {
+            data: MyEventData { fd, kind },
+        };
+        flags |= EpollFlags::EPOLLET;
         let mut event = EpollEvent::new(flags, unsafe { event_data.u64 });
 
         epoll_ctl(self.fd, EpollOp::EpollCtlAdd, fd, &mut event)?;
-
-        self.registered.insert(fd, kind);
 
         Ok(())
     }
@@ -68,7 +66,7 @@ impl Epoll {
         &'a mut self,
         events: &'b mut [EpollEvent],
     ) -> Result<&'b [EpollEvent], Errno> {
-        debug!("Polling...");
+        debug!("Polling events...");
         let event_count = epoll_wait(
             self.fd,
             events,
@@ -94,6 +92,14 @@ pub(crate) union EventData {
     pub fd: i32,
     pub u32: u32,
     pub u64: u64,
+    pub data: MyEventData,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct MyEventData {
+    pub fd: i32,
+    pub kind: FdType,
 }
 
 // Example poll loop. Used in examples in $CARGO_MANIFEST_DIR/examples
@@ -103,16 +109,13 @@ pub fn example_epoll_event_loop(mut epoll: Epoll) {
 
     loop {
         for event in epoll.poll(&mut events_buf).unwrap() {
-            let data = EventData { u64: event.data() };
-            let fd = unsafe { data.fd };
-            let kind = epoll.registered.get(&fd).unwrap();
+            let MyEventData { fd, kind } = unsafe { EventData { u64: event.data() }.data };
 
             debug!("Reading file descriptor {fd}");
 
             let bytes = match read(fd, &mut buf) {
                 Ok(bytes_read) if bytes_read == 0 => {
                     epoll.remove_fd(fd).unwrap();
-                    epoll.registered.remove(&fd);
                     continue;
                 }
                 Ok(bytes_read) => &buf[0..bytes_read],
@@ -141,5 +144,20 @@ pub fn example_epoll_event_loop(mut epoll: Epoll) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::epoll::{EventData, MyEventData};
+
+    #[test]
+    fn event_data_is_8bytes() {
+        assert_eq!(std::mem::size_of::<EventData>(), 8);
+    }
+
+    #[test]
+    fn my_event_data_is_8bytes() {
+        assert_eq!(std::mem::size_of::<MyEventData>(), 8);
     }
 }

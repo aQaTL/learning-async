@@ -7,7 +7,9 @@ use learning_async::sleep::sleep;
 use learning_async::tcp::TcpStream;
 
 fn main() -> color_eyre::Result<()> {
-    aqa_logger::init();
+    // aqa_logger::init_with_level(log::LevelFilter::Info);
+    // aqa_logger::init();
+    env_logger::init();
 
     let mut rt = Runtime::new()?;
 
@@ -60,11 +62,13 @@ fn main() -> color_eyre::Result<()> {
             }
         }
 
+        info!("Dropping tcp stream");
+        // drop(tcp_stream);
         // info!("Received message: {}", String::from_utf8_lossy(&main_buf));
         info!("Message size: {}", main_buf.len());
         let elapsed = start.elapsed();
         info!("Main fut elapsed: {}", humantime::format_duration(elapsed));
-        sleep(Duration::from_millis(2)).await;
+        sleep(Duration::from_millis(5000)).await;
         let elapsed = start.elapsed();
         info!("After sleep : {}", humantime::format_duration(elapsed));
     });

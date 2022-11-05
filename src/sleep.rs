@@ -1,3 +1,4 @@
+use log::debug;
 use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
@@ -47,6 +48,7 @@ impl Future for Sleep {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.started.is_none() {
+            debug!("Sleep not started. Registering.");
             self.started = Some(Instant::now());
             self.timer
                 .set(
@@ -66,6 +68,7 @@ impl Future for Sleep {
         } else if self.expired() {
             Poll::Ready(())
         } else {
+            debug!("Timer still pending");
             Poll::Pending
         }
     }
